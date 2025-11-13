@@ -8,9 +8,17 @@ Single RDS SQL Server instance serving all freemium users with dedicated schemas
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
+│           SINGLE HUBSPOT APP (Marketplace)                       │
+│  • OAuth scopes: crm.objects.deals.read                         │
+│  • Installs on customer's HubSpot account                       │
+└─────────────────────────────────────────────────────────────────┘
+                      │ OAuth flow (all tiers)
+                      ▼
+┌─────────────────────────────────────────────────────────────────┐
 │                    MANAGEMENT PORTAL                            │
 │           (mgmt.awssome.io - Central DB + WebApp)               │
 │  • Customer metadata, AWS roles, tenant registry                │
+│  • Tenant tier tracking (free vs paid)                          │
 └─────────────────────────────────────────────────────────────────┘
                                 ▲
                                 │ Centralized API
@@ -23,6 +31,7 @@ Single RDS SQL Server instance serving all freemium users with dedicated schemas
 ├──────────────────────┤  ├──────────────────┤  ├──────────────────┤
 │ Elastic Beanstalk    │  │ Elastic Beanstalk│  │ Elastic Beanstalk│
 │ (Shared Instance)    │  │ (Shared Instance)│  │ (Shared Instance)│
+│ + HubSpot Sync UI    │  │ + HubSpot Sync   │  │ + HubSpot Sync   │
 └──────────┬───────────┘  └────────┬─────────┘  └────────┬─────────┘
            │                       │                     │
            ▼                       ▼                     ▼
@@ -32,11 +41,19 @@ Single RDS SQL Server instance serving all freemium users with dedicated schemas
 ├──────────────────────┤  │                  │  │                  │
 │ Schema: user_1       │  │ All features     │  │ All features     │
 │  ├─ DealReg tables   │  │ + DealReg        │  │ + DealReg        │
-│ Schema: user_2       │  │                  │  │                  │
-│  ├─ DealReg tables   │  └──────────────────┘  └──────────────────┘
+│  ├─ HubSpotTokens    │  │                  │  │                  │
+│  ├─ HubSpotMappings  │  │                  │  │                  │
+│ Schema: user_2       │  └──────────────────┘  └──────────────────┘
+│  ├─ DealReg tables   │
+│  ├─ HubSpotTokens    │
 │ Schema: user_N       │
 │  ├─ DealReg tables   │
+│  ├─ HubSpotTokens    │
 │ (1000+ schemas)      │
+│                      │
+│ Tier-aware sync:     │
+│ • Free: 10 deals max │
+│ • Paid: Unlimited    │
 └──────────────────────┘
 ```
 
@@ -55,72 +72,120 @@ user_X in freemium → Triggers:
 
 ### Schema Creation on Signup
 
-```sql
--- Create dedicated schema for new freemium user
-CREATE SCHEMA [user_abc123];
+Each freemium user receives:
+- **Dedicated schema** in shared SQL Server database (e.g., `user_abc123`)
+- **Deal Registration tables** for storing AWS Marketplace deals
+- **HubSpot integration tables**:
+  - OAuth tokens (access/refresh tokens, HubSpot portal ID)
+  - Deal mappings (links HubSpot deals to Awssome deal registrations)
+  - Sync history (tracks import success/failures)
+- **Schema-level permissions** ensuring user can only access their own data
 
--- Create Deal Registration table
-CREATE TABLE [user_abc123].[DealRegistrations] (
-    id BIGINT IDENTITY PRIMARY KEY,
-    deal_name NVARCHAR(255) NOT NULL,
-    aws_role_arn VARCHAR(500),
-    product_id VARCHAR(100),
-    customer_name NVARCHAR(255),
-    deal_value DECIMAL(18, 2),
-    status VARCHAR(50) DEFAULT 'draft',
-    created_at DATETIME2 DEFAULT GETDATE(),
-    updated_at DATETIME2 DEFAULT GETDATE()
-);
+### Data Access Pattern
 
--- Create dedicated application user for this schema
-CREATE USER [user_abc123_app] FOR LOGIN [freemium_app];
-
--- Grant permissions only to this schema
-GRANT SELECT, INSERT, UPDATE, DELETE ON SCHEMA::[user_abc123] TO [user_abc123_app];
-```
-
-### Application Query Pattern
-
-```sql
--- Application uses schema-qualified queries
--- Connection string contains tenant_schema context
-
--- Example: Fetch deals for tenant
-SELECT * FROM [user_abc123].[DealRegistrations]
-WHERE status = 'active';
-
--- Example: Create new deal
-INSERT INTO [user_abc123].[DealRegistrations]
-(deal_name, aws_role_arn, product_id, customer_name, deal_value)
-VALUES
-('Deal ABC', 'arn:aws:iam::123456789012:role/Publisher', 'prod-123', 'Acme Corp', 50000.00);
-```
+- Application uses **schema-qualified queries** (e.g., `SELECT * FROM [user_abc123].[DealRegistrations]`)
+- Connection string includes tenant schema context
+- Database enforces namespace isolation via SQL Server schema permissions
+- No cross-schema access possible without explicit permissions
 
 ### Migration on Upgrade
 
-```sql
--- Step 1: Export schema data
--- Use SQL Server Management Studio or bcp utility
-bcp [freemium_db].[user_abc123].[DealRegistrations] out deals.dat -N -S server -U user -P pass
+**Process:**
+1. **Export schema** - Use native SQL Server tools (bcp utility or SSMS) to extract all tenant data
+2. **Provision dedicated RDS** - Create new SQL Server instance via AWS API/Terraform
+3. **Import data** - Restore tenant data to new dedicated database
+4. **Update registry** - Management Portal points to new DB host
+5. **Cleanup** - Delete schema from freemium DB after 30-day retention period
 
--- Step 2: Create new dedicated RDS instance (via AWS API/Terraform)
--- New instance: customer-abc123-db.xxxxx.us-east-1.rds.amazonaws.com
+**Benefits:**
+- Schema export/import is native SQL Server operation (simple, reliable)
+- HubSpot OAuth tokens automatically migrate (no app reinstall)
+- Zero downtime possible with dual-run strategy
+- Rollback available during retention period
 
--- Step 3: Import to new database
-bcp [customer_db].[dbo].[DealRegistrations] in deals.dat -N -S new-server -U user -P pass
+## HubSpot Integration
 
--- Step 4: Update Management Portal registry
-UPDATE CustomerRegistry
-SET db_host = 'customer-abc123-db.xxxxx.us-east-1.rds.amazonaws.com',
-    db_name = 'customer_db',
-    tier = 'paid',
-    migrated_at = GETDATE()
-WHERE tenant_id = 'user_abc123';
+### Overview
 
--- Step 5: Clean up freemium DB after verification (wait 30 days)
-DROP SCHEMA [user_abc123] CASCADE;
-DROP USER [user_abc123_app];
-```
+Single HubSpot app for all tiers (freemium & paid). Tier-aware backend applies deal limits based on tenant subscription.
+
+### HubSpot API Constraints
+
+**Rate Limits (per customer's HubSpot account):**
+- **Free/Starter**: 100 req/10sec, 250k daily
+- **Professional**: 190 req/10sec, 625k daily
+- **Enterprise**: 190 req/10sec, 1M daily
+- **Burst limit**: 110 req/10sec per OAuth app install
+
+**Key Points:**
+- Rate limits apply to **customer's HubSpot account**, not your app
+- Manual sync trigger = lower API usage
+- Batch API recommended (100 deals per request)
+
+### OAuth Flow
+
+**Process:**
+1. User clicks "Connect HubSpot" in Awssome portal
+2. Redirected to HubSpot OAuth authorization page
+3. User approves connection (grants `crm.objects.deals.read` permission)
+4. HubSpot redirects back with authorization code
+5. Backend exchanges code for access/refresh tokens
+6. Tokens stored in tenant's schema (HubSpotTokens table)
+7. User redirected back to Awssome with "Connected" status
+
+**Key Benefits:**
+- OAuth app installs on **customer's HubSpot account** (uses their API quota)
+- Single app for all tiers (freemium & paid)
+- No app reinstall needed when upgrading
+
+### Tier-Aware Deal Sync
+
+**Sync Process:**
+1. User clicks "Sync Deals from HubSpot" button (manual trigger)
+2. Backend checks tenant tier from Management Portal
+3. **Free tier**: Fetch maximum 10 deals
+4. **Paid tier**: Fetch unlimited deals
+5. Use HubSpot Batch API (100 deals per request)
+6. Import deals as Awssome Deal Registrations
+7. Create mappings (links HubSpot deal ID → Awssome deal ID)
+8. Log sync history (success/failure, deal counts)
+
+**Rate Limiting:**
+- Respects customer's HubSpot API limits (not yours)
+- Batch requests reduce API call count
+- Manual trigger = low API usage (no polling/webhooks)
+
+### User Experience
+
+**Connection Flow:**
+- "Connect HubSpot" button in settings
+- OAuth consent screen (HubSpot-hosted)
+- "✓ HubSpot Connected" confirmation
+- Display HubSpot portal name/ID
+
+**Sync Flow:**
+- "Sync Deals" button (disabled while syncing)
+- Progress indicator during import
+- Success message: "Imported X of Y deals"
+- Free tier shows "(Free tier: 10 deals max)" warning
+
+### Migration with HubSpot Data
+
+**Upgrade Process:**
+1. Export tenant's schema (includes all HubSpot tables)
+2. Import to new dedicated database
+3. HubSpot OAuth tokens automatically migrate
+4. No app reinstall required
+5. Sync resumes with unlimited deal limit (paid tier)
+
+### HubSpot Integration Benefits
+
+✅ **Single OAuth flow**: Free & paid users install same HubSpot app
+✅ **No reinstall on upgrade**: Tokens migrate with data
+✅ **Customer's rate limits**: Uses their HubSpot API quota
+✅ **Tier-aware**: Backend enforces 10-deal limit for free users
+✅ **Manual trigger**: Low API usage, no webhook complexity
+✅ **Simple architecture**: One codebase, one marketplace listing
 
 ## Pros
 
@@ -132,6 +197,8 @@ DROP USER [user_abc123_app];
 ✅ **Rollback friendly**: Keep schema X days after upgrade for verification
 ✅ **Standard SQL pattern**: Well-understood approach, easy to maintain
 ✅ **Backup simplicity**: Single backup covers all freemium users
+✅ **HubSpot integration**: Single OAuth app for all tiers, no reinstall on upgrade
+✅ **Tier-aware sync**: Automatically enforce 10-deal limit for free users
 
 ## Cons
 
@@ -209,7 +276,7 @@ DROP USER [user_abc123_app];
 
 ## Implementation Timeline
 
-### Phase 1: MVP (2-3 weeks)
+### Phase 1: Core Freemium MVP (2-3 weeks)
 - [ ] Design schema template for Deal Registration
 - [ ] Build schema provisioning automation
 - [ ] Implement signup flow with CloudFormation runner
@@ -217,69 +284,60 @@ DROP USER [user_abc123_app];
 - [ ] Store tenant → schema mapping in Management Portal
 - [ ] Update freemium webapp to route queries to correct schema
 
-### Phase 2: Migration Flow (1-2 weeks)
+### Phase 2: HubSpot Integration (2-3 weeks)
+- [ ] Create HubSpot app in developer portal (OAuth scopes: crm.objects.deals.read)
+- [ ] Implement OAuth flow (authorization, callback, token storage)
+- [ ] Add HubSpot tables to schema template (tokens, mappings, sync history)
+- [ ] Build tier-aware sync service (10 deals for free, unlimited for paid)
+- [ ] Implement rate limiting and batch API calls
+- [ ] Create "Connect HubSpot" UI in Awssome portal
+- [ ] Build manual sync trigger with progress indicator
+- [ ] Test OAuth flow for freemium & paid tenants
+
+### Phase 3: Migration Flow (1-2 weeks)
 - [ ] Build upgrade trigger in Management Portal
 - [ ] Automate RDS provisioning via AWS API/Terraform
-- [ ] Implement schema export/import pipeline
+- [ ] Implement schema export/import pipeline (include HubSpot tables)
 - [ ] Create DNS update automation
 - [ ] Build tenant registry update logic
 - [ ] Add schema cleanup job (30-day delay)
+- [ ] Test HubSpot integration continues working post-migration
 
-### Phase 3: Monitoring & Operations (1 week)
+### Phase 4: Monitoring & Operations (1 week)
 - [ ] Set up CloudWatch metrics per schema (query count, data size)
 - [ ] Implement alerting for shared resource contention
 - [ ] Create operational runbook for schema management
 - [ ] Build admin dashboard showing schema stats
+- [ ] Add HubSpot sync monitoring (success rate, API usage)
+- [ ] Set up alerts for OAuth token expiration
 
 ## Operational Runbook
 
 ### Common Tasks
 
 **Add new freemium user:**
-```bash
-# 1. User completes signup
-# 2. Run CloudFormation in their AWS account
-# 3. Capture IAM role ARN
-# 4. Provision schema:
-sqlcmd -S freemium-db -i provision_schema.sql -v tenant_id="user_abc123"
-```
+1. User completes signup on freemium.awssome.io
+2. Run CloudFormation template in their AWS account
+3. Capture IAM role ARN for AWS Marketplace access
+4. Automatically provision schema using SQL scripts
+5. Store tenant → schema mapping in Management Portal
+6. User can now access their portal and create deals
 
 **Upgrade user to paid:**
-```bash
-# 1. Trigger upgrade from Management Portal
-# 2. Provision new RDS instance
-terraform apply -var="tenant_id=user_abc123"
-
-# 3. Export schema
-./scripts/export_schema.sh user_abc123 freemium-db
-
-# 4. Import to new DB
-./scripts/import_schema.sh user_abc123 customer-abc123-db
-
-# 5. Update registry and DNS
-./scripts/cutover_tenant.sh user_abc123
-
-# 6. Schedule cleanup
-./scripts/schedule_cleanup.sh user_abc123 30
-```
+1. Trigger upgrade from Management Portal
+2. Provision new dedicated RDS instance (Terraform/AWS API)
+3. Export tenant's schema using native SQL Server tools
+4. Import data to new dedicated database
+5. Update Management Portal registry (point to new DB)
+6. Update DNS (userX.awssome.io → new infrastructure)
+7. Schedule schema cleanup after 30-day retention
 
 **Monitor freemium DB health:**
-```sql
--- Check schema count
-SELECT COUNT(*) FROM sys.schemas WHERE name LIKE 'user_%';
-
--- Check top resource consumers
-SELECT TOP 10
-    SCHEMA_NAME(t.schema_id) as schema_name,
-    SUM(p.rows) as row_count,
-    SUM(a.total_pages) * 8 / 1024 as size_mb
-FROM sys.tables t
-INNER JOIN sys.partitions p ON t.object_id = p.object_id
-INNER JOIN sys.allocation_units a ON p.partition_id = a.container_id
-WHERE SCHEMA_NAME(t.schema_id) LIKE 'user_%'
-GROUP BY SCHEMA_NAME(t.schema_id)
-ORDER BY size_mb DESC;
-```
+- **Schema count**: Track total freemium users
+- **Top resource consumers**: Identify heavy users (row counts, storage)
+- **Query performance**: Monitor slow queries per schema
+- **HubSpot sync metrics**: Success rate, API usage per tenant
+- **Storage growth**: Forecast when to upgrade instance size
 
 ## Risk Assessment
 
