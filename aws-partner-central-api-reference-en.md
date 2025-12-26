@@ -2,8 +2,6 @@
 
 API reference for Partner Central Selling and Account SDKs. This document categorizes and describes all endpoints at the business level.
 
-> 📘 **Vietnamese version**: [aws-partner-central-api-reference.md](./aws-partner-central-api-reference.md)
-
 ---
 
 ## Overview
@@ -572,3 +570,4 @@ StartEngagementFromOpportunityTask
 - **ClientToken**: Used to ensure idempotency for create operations
 - **Pagination**: Use `NextToken` to iterate through multiple pages
 - **Catalog**: `AWS` (production) or `Sandbox` (testing)
+
